@@ -1,0 +1,33 @@
+# Entornos virtuales de Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Manuscrito y bitácora del libro: nunca al repositorio
+libro/
+
+# Bóvedas forenses locales, claves y telemetría sensible
+*.duckdb
+*.duckdb.wal
+*.key
+*.log
+forensic_reports/
+releases/
+
+# Pesos de modelos locales (se alojan en D:\models o Hugging Face)
+*.gguf
+*.safetensors
+*.bin
+
+# Variables de entorno y secretos
+.env
+.env.local
+
+# Archivos de sistema e IDE
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
