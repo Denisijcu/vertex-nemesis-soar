@@ -64,6 +64,25 @@ def init_vault() -> None:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                action_id      VARCHAR PRIMARY KEY,
+                created_at     VARCHAR,
+                expires_at     VARCHAR,
+                severity       VARCHAR,
+                tool           VARCHAR,
+                arguments_json VARCHAR,
+                context        VARCHAR,
+                evidence       VARCHAR,
+                dry_run        BOOLEAN,
+                state          VARCHAR,
+                request_event  VARCHAR,
+                decided_at     VARCHAR,
+                decision_note  VARCHAR,
+                decision_event VARCHAR,
+                result_json    VARCHAR
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS active_blocks (
                 rule_name  VARCHAR PRIMARY KEY,
                 ip         VARCHAR,
@@ -206,3 +225,67 @@ def list_blocks(only_active: bool = True) -> list[dict]:
         rows = conn.execute(sql + " ORDER BY created_at DESC").fetchall()
     keys = ["rule_name", "ip", "created_at", "expires_at", "state", "event_id"]
     return [dict(zip(keys, r)) for r in rows]
+
+
+# ---------- acciones pendientes de aprobación humana (fase 2.1) ----------
+
+_PENDING_COLS = ["action_id", "created_at", "expires_at", "severity", "tool", "arguments",
+                 "context", "evidence", "dry_run", "state", "request_event", "decided_at",
+                 "decision_note", "decision_event", "result"]
+
+
+def _pending_row(r) -> dict:
+    d = dict(zip(_PENDING_COLS, r))
+    d["arguments"] = json.loads(d["arguments"] or "{}")
+    d["result"] = json.loads(d["result"]) if d["result"] else None
+    return d
+
+
+def add_pending(action_id: str, created_at: str, expires_at: str, severity: str, tool: str,
+                args: dict, context: str, evidence: str, dry_run: bool) -> None:
+    with _lock, _connect() as conn:
+        conn.execute(
+            "INSERT INTO pending_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, NULL)",
+            (action_id, created_at, expires_at, severity, tool, _canonical(args or {}),
+             context, evidence, dry_run),
+        )
+
+
+def link_pending_request(action_id: str, event_id: str) -> None:
+    with _lock, _connect() as conn:
+        conn.execute("UPDATE pending_actions SET request_event = ? WHERE action_id = ?",
+                     (event_id, action_id))
+
+
+def get_pending(action_id: str) -> dict | None:
+    with _connect() as conn:
+        r = conn.execute(f"SELECT {', '.join(c if c not in ('arguments', 'result') else c + '_json' for c in _PENDING_COLS)} "
+                         "FROM pending_actions WHERE action_id = ?", (action_id,)).fetchone()
+    return _pending_row(r) if r else None
+
+
+def claim_pending(action_id: str, new_state: str, decided_at: str, note: str) -> bool:
+    """Pasa una acción de PENDING a otro estado. Atómico: solo uno gana si hay dos clics."""
+    with _lock, _connect() as conn:
+        r = conn.execute("SELECT state FROM pending_actions WHERE action_id = ?", (action_id,)).fetchone()
+        if not r or r[0] != "PENDING":
+            return False
+        conn.execute("UPDATE pending_actions SET state = ?, decided_at = ?, decision_note = ? "
+                     "WHERE action_id = ?", (new_state, decided_at, note, action_id))
+        return True
+
+
+def finish_pending(action_id: str, decision_event: str, result) -> None:
+    with _lock, _connect() as conn:
+        conn.execute("UPDATE pending_actions SET decision_event = ?, result_json = ? WHERE action_id = ?",
+                     (decision_event, _canonical(result) if result is not None else None, action_id))
+
+
+def list_pending(only_open: bool = True) -> list[dict]:
+    cols = ", ".join(c if c not in ("arguments", "result") else c + "_json" for c in _PENDING_COLS)
+    sql = f"SELECT {cols} FROM pending_actions"
+    if only_open:
+        sql += " WHERE state = 'PENDING'"
+    with _connect() as conn:
+        rows = conn.execute(sql + " ORDER BY created_at DESC").fetchall()
+    return [_pending_row(r) for r in rows]

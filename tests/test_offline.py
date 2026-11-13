@@ -1,4 +1,4 @@
-"""Pruebas offline de Vertex Nemesis SOAR v1.1.
+"""Pruebas offline de Vertex Nemesis SOAR v1.2.
 
 No necesitan LM Studio ni tocan el firewall: el modelo se simula con salidas
 fijas y netsh se reemplaza por un falso. Usan una bóveda y una clave
@@ -18,13 +18,14 @@ TMP = Path(tempfile.mkdtemp(prefix="vertex_soar_test_"))
 os.environ["VERTEX_SOAR_DB"] = str(TMP / "test_vault.duckdb")
 os.environ["VERTEX_VAULT_KEY_FILE"] = str(TMP / "test.key")
 os.environ["VERTEX_PROTECTED_IPS"] = "192.168.1.1"
+os.environ["VERTEX_OPERATOR_TOKEN_FILE"] = str(TMP / "operator.token")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import duckdb  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
 import app as soar  # noqa: E402
-from core import defense_ops, vault  # noqa: E402
+from core import approvals, defense_ops, vault  # noqa: E402
 
 RESULTS = []
 
@@ -34,15 +35,19 @@ def check(name: str, condition: bool, detail: str = "") -> None:
     print(f"  {'PASS' if condition else 'FAIL'}  {name}" + (f"  -> {detail}" if detail and not condition else ""))
 
 
-def run_alert(model_output: str, context: str, question: str = "Contén la amenaza.", dry_run=True):
+def run_alert(model_output: str, context: str, question: str = "Contén la amenaza.", dry_run=True,
+              severity="ROJO"):
+    # Secciones 1 a 3 usan ROJO: prueban lo mismo que en la v1.1 (ejecución directa).
     soar.call_model = lambda system, user: ("modelo-simulado", model_output)
-    return soar.analyze_and_contain(soar.TelemetryAlert(context=context, question=question, dry_run=dry_run))
+    return soar.analyze_and_contain(soar.TelemetryAlert(context=context, question=question,
+                                                        dry_run=dry_run, severity=severity))
 
 
 CTX_SSH = ("Alerta de red: Tráfico anómalo en subred 192.168.1.0/24. "
            "Fuerza bruta SSH en puerto 22 desde 192.168.1.100.")
 
 vault.init_vault()
+TOKEN = approvals.load_operator_token()
 print(f"\nBóveda temporal: {TMP}\n")
 
 print("1. Decisiones del modelo")
@@ -169,7 +174,12 @@ res = defense_ops.unblock_rule("Regla_De_Windows_Importante")
 check("borrar una regla que no es del SOAR -> REJECTED_FOREIGN_RULE",
       res["result"] == "REJECTED_FOREIGN_RULE")
 
-out = soar.human_unblock(rule)
+try:
+    soar.human_unblock(rule, x_operator_token="token-falso")
+    check("desbloqueo sin token válido -> 403", False)
+except HTTPException as e:
+    check("desbloqueo sin token válido -> 403", e.status_code == 403)
+out = soar.human_unblock(rule, x_operator_token=TOKEN)
 check("desbloqueo manual -> NETSH_RULE_REMOVED", out["soar_execution"]["result"] == "NETSH_RULE_REMOVED")
 check("ya no hay bloqueos activos", len(vault.list_blocks()) == 0)
 
@@ -186,6 +196,92 @@ check("netstat en español (ESCUCHANDO) -> 2 puertos en escucha", ports["listeni
 check("detecta 0.0.0.0:8000 expuesto a toda la red",
       [p["local"] for p in ports["exposed_all_interfaces"]] == ["0.0.0.0:8000"])
 check("cadena del ledger íntegra tras todo lo anterior", vault.verify_chain()["intact"])
+
+print("\n4. Aprobación humana (fase 2.1)")
+calls.clear()
+BLOCK_77 = '{"tool": "block_firewall_ip", "arguments": {"ip_address": "203.0.113.77", "rule_name": "SCAN"}}'
+CTX_77 = "Escaneo de puertos masivo desde 203.0.113.77 contra la red interna."
+
+r = run_alert(BLOCK_77, CTX_77, dry_run=False, severity="AMARILLO")
+aid = r["soar_execution"].get("action_id", "")
+check("AMARILLO -> PENDING_APPROVAL", r["status"] == "PENDING_APPROVAL", str(r["status"]))
+check("AMARILLO no toca el firewall mientras espera", not any("netsh" in c for c in calls), str(calls))
+check("la pendiente aparece en /pending", [p["action_id"] for p in soar.get_pending()["pending"]] == [aid])
+
+try:
+    soar.approve_pending(aid, None, x_operator_token=None)
+    check("aprobar sin token -> 403", False)
+except HTTPException as e:
+    check("aprobar sin token -> 403", e.status_code == 403)
+check("tras el 403 sigue pendiente y sin netsh",
+      vault.get_pending(aid)["state"] == "PENDING" and not any("netsh" in c for c in calls))
+
+out = soar.approve_pending(aid, soar.Decision(note="confirmado en el reporte"), x_operator_token=TOKEN)
+check("aprobar con token -> NETSH_RULE_APPLIED",
+      out["soar_execution"]["result"] == "NETSH_RULE_APPLIED", str(out["soar_execution"]))
+check("queda APPROVED con la nota del operador",
+      vault.get_pending(aid)["state"] == "APPROVED"
+      and vault.get_pending(aid)["decision_note"] == "confirmado en el reporte")
+try:
+    soar.approve_pending(aid, None, x_operator_token=TOKEN)
+    check("aprobar dos veces -> 409", False)
+except HTTPException as e:
+    check("aprobar dos veces -> 409", e.status_code == 409)
+soar.human_unblock(out["soar_execution"]["rule_name"], x_operator_token=TOKEN)
+
+r = run_alert(BLOCK_77, CTX_77, dry_run=False, severity="AMARILLO")
+aid2 = r["soar_execution"]["action_id"]
+calls.clear()
+out = soar.reject_pending(aid2, soar.Decision(note="falso positivo"), x_operator_token=TOKEN)
+check("rechazar -> HUMAN_REJECTED sin netsh",
+      out["soar_execution"]["result"] == "HUMAN_REJECTED" and not calls)
+
+r = run_alert(BLOCK_77, CTX_77, dry_run=False, severity="AMARILLO")
+aid3 = r["soar_execution"]["action_id"]
+with duckdb.connect(str(vault.DB_PATH)) as c:
+    c.execute("UPDATE pending_actions SET expires_at = ? WHERE action_id = ?",
+              ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), aid3))
+try:
+    soar.approve_pending(aid3, None, x_operator_token=TOKEN)
+    check("aprobar una pendiente caducada -> 409", False)
+except HTTPException as e:
+    check("aprobar una pendiente caducada -> 409 (EXPIRED)",
+          e.status_code == 409 and vault.get_pending(aid3)["state"] == "EXPIRED")
+
+r = run_alert(BLOCK_77, CTX_77, dry_run=False, severity="AMARILLO")
+aid4 = r["soar_execution"]["action_id"]
+with duckdb.connect(str(vault.DB_PATH)) as c:
+    c.execute("UPDATE pending_actions SET context = 'contexto sin la IP' WHERE action_id = ?", (aid4,))
+out = soar.approve_pending(aid4, None, x_operator_token=TOKEN)
+check("al aprobar se vuelve a verificar el grounding",
+      out["soar_execution"]["result"] == "REJECTED_UNGROUNDED", str(out["soar_execution"]))
+
+r = run_alert('{"tool": "block_firewall_ip", "arguments": {"ip_address": "127.0.0.1"}}',
+              "Escaneo desde 127.0.0.1.", severity="AMARILLO")
+check("AMARILLO contra IP protegida -> rechazo directo, sin pendiente",
+      r["status"] == "REJECTED_PROTECTED_IP" and "action_id" not in r["soar_execution"])
+
+r = run_alert(BLOCK_77, CTX_77, dry_run=False, severity="VERDE")
+check("VERDE + bloqueo -> REJECTED_LOW_SEVERITY", r["status"] == "REJECTED_LOW_SEVERITY", str(r["status"]))
+r = run_alert('{"tool_call": {"name": "check_listening_ports", "arguments": {}}}',
+              "Revisión rutinaria de puertos.", severity="VERDE")
+check("VERDE + solo lectura -> VERIFIED_OK", r["status"] == "VERIFIED_OK", str(r["status"]))
+
+try:
+    run_alert(BLOCK_77, CTX_77, severity="NARANJA")
+    check("severidad inválida -> 422", False)
+except HTTPException as e:
+    check("severidad inválida -> 422", e.status_code == 422)
+
+r = run_alert(BLOCK_77, CTX_77, dry_run=False, severity="red")
+check("ROJO (también 'red') -> ejecuta directo", r["soar_execution"]["result"] == "NETSH_RULE_APPLIED",
+      str(r["soar_execution"]))
+
+statuses = {e["status"] for e in vault.read_ledger(limit=500)}
+check("el ledger registra pendiente, aprobación, rechazo y caducidad",
+      {"PENDING_APPROVAL", "HUMAN_APPROVED", "HUMAN_REJECTED", "PENDING_EXPIRED"} <= statuses,
+      str(statuses))
+check("cadena del ledger íntegra al final", vault.verify_chain()["intact"])
 
 passed = sum(RESULTS)
 print(f"\nResultado: {passed}/{len(RESULTS)} pruebas pasadas")

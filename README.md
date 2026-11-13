@@ -1,4 +1,4 @@
-# 🛡️ Vertex Nemesis SOAR v1.1 — Contención autónoma con grounding verificado
+# 🛡️ Vertex Nemesis SOAR v1.2 — Contención con grounding verificado y aprobación humana
 
 **Desarrollado por:** [Vertex Coders LLC](https://vertex-services.org) (Miami, FL)
 **Fundador:** Denis Sanchez Leyva (`@Denisijcu`)
@@ -28,6 +28,10 @@ alerta ──► modelo (LM Studio, T=0) ──► ¿abstención? ── sí ─
                              ¿IP protegida? ── sí ──► REJECTED_PROTECTED_IP
                                            │ no
                                            ▼
+                   severidad ── VERDE ──► REJECTED_LOW_SEVERITY (no toca el firewall)
+                       │    └── AMARILLO ──► PENDING_APPROVAL ──► el operador aprueba o rechaza
+                       │ ROJO                                       (con token)
+                       ▼
                     netsh: regla de entrada + salida, con expiración ──► VERIFIED_OK
                                            │
                                            ▼
@@ -42,8 +46,10 @@ alerta ──► modelo (LM Studio, T=0) ──► ¿abstención? ── sí ─
 | `core/grounding.py` | Comprueba que cada IP propuesta aparezca en el `[CONTEXTO]`. La `[PREGUNTA]` no cuenta como fuente, porque por ahí entraría una orden inyectada. |
 | `core/defense_ops.py` | `netsh` con `shell=False`, IPs protegidas, expiración, rollback y solo reglas `VTX_*`. |
 | `core/vault.py` | Ledger encadenado: cada evento lleva el hash del anterior y un HMAC con una clave que no vive en la base de datos. |
+| `core/approvals.py` | Severidad y aprobación humana: pendientes, token del operador, caducidad. |
 | `core/config.py` | Rutas y ajustes, todos cambiables por variables de entorno. |
-| `tests/test_offline.py` | 28 pruebas sin LM Studio ni firewall (modelo y netsh simulados). |
+| `soar_operator.py` | Consola del operador: ver pendientes, aprobar, rechazar, desbloquear. |
+| `tests/test_offline.py` | 47 pruebas sin LM Studio ni firewall (modelo y netsh simulados). |
 | `client_test.py` | Examen en vivo contra el modelo real, todo en `dry_run`. |
 
 ## Herramientas del modelo
@@ -57,6 +63,35 @@ alerta ──► modelo (LM Studio, T=0) ──► ¿abstención? ── sí ─
 `DELETE /api/v1/blocks/{rule_name}`. Así un log envenenado no puede pedirle al modelo que
 quite un bloqueo.
 
+## Severidad y aprobación humana
+
+Cada alerta lleva `severity` (por defecto `AMARILLO`). Solo afecta a las herramientas que
+cambian algo; `check_listening_ports` corre con cualquier severidad.
+
+| Severidad | `block_firewall_ip` |
+| :--- | :--- |
+| `ROJO` | Se ejecuta en el momento, con todas las verificaciones. |
+| `AMARILLO` | Queda `PENDING_APPROVAL`. No se ejecuta hasta que el operador la apruebe. Caduca sola a los `VERTEX_PENDING_TTL_MINUTES` (30). |
+| `VERDE` | `REJECTED_LOW_SEVERITY`: una alerta informativa no autoriza tocar el firewall. |
+
+Aprobar, rechazar y desbloquear exigen la cabecera `X-Operator-Token`. El token se crea solo
+la primera vez en `%USERPROFILE%\.vertex\soar_operator.token`. Así ni el modelo, ni otro
+programa local, ni una página web abierta en el navegador pueden aprobar nada.
+
+Al aprobar se vuelven a pasar las verificaciones sobre el contexto guardado (grounding,
+IPs protegidas, bloqueo duplicado), porque entre la alerta y el clic pudo cambiar algo.
+Si una IP protegida llega en AMARILLO, se rechaza directamente: no se crea pendiente.
+
+Consola del operador (desde la carpeta del proyecto, con el venv activado):
+
+```powershell
+python soar_operator.py pendientes
+python soar_operator.py aprobar PND-...  "motivo"
+python soar_operator.py rechazar PND-... "motivo"
+python soar_operator.py bloqueos
+python soar_operator.py desbloquear VTX_...
+```
+
 ## IPs que nunca se bloquean
 
 Loopback, `0.0.0.0`, multicast, broadcast, link-local, rangos reservados, las IPs de esta
@@ -67,12 +102,15 @@ máquina, la puerta de enlace por defecto (leída de `route print`) y las que po
 
 | Método | Ruta | Uso |
 | :--- | :--- | :--- |
-| POST | `/api/v1/analyze-and-contain` | Analiza una alerta. `dry_run` es `true` por defecto. |
+| POST | `/api/v1/analyze-and-contain` | Analiza una alerta. `dry_run` es `true` y `severity` es `AMARILLO` por defecto. |
 | GET | `/api/v1/ledger?limit=25` | Últimos eventos. |
 | GET | `/api/v1/ledger/verify` | Recorre la cadena y dice si alguien la tocó. |
 | GET | `/api/v1/ledger/anchor` | Último hash, para anclarlo fuera de la máquina. |
 | GET | `/api/v1/blocks` | Bloqueos activos (`?all=true` para el histórico). |
-| DELETE | `/api/v1/blocks/{rule_name}` | Desbloqueo manual del operador. |
+| DELETE | `/api/v1/blocks/{rule_name}` | Desbloqueo manual del operador (token). |
+| GET | `/api/v1/pending` | Acciones esperando decisión (`?all=true` para el histórico). |
+| POST | `/api/v1/pending/{id}/approve` | Aprobar (token). Cuerpo opcional: `{"note": "..."}`. |
+| POST | `/api/v1/pending/{id}/reject` | Rechazar (token). Cuerpo opcional: `{"note": "..."}`. |
 | POST | `/api/v1/blocks/expire` | Quita ya los bloqueos vencidos. |
 | GET | `/api/v1/health` | Versión, IPs protegidas y herramientas. |
 
@@ -111,6 +149,8 @@ PowerShell **como administrador**. Para forzar el modo seguro siempre:
 | `VERTEX_BLOCK_TTL_MINUTES` | `60` |
 | `VERTEX_PROTECTED_IPS` | vacío |
 | `VERTEX_SOAR_DRY_RUN` | `0` (con `1` nunca toca el firewall) |
+| `VERTEX_OPERATOR_TOKEN_FILE` | `%USERPROFILE%\.vertex\soar_operator.token` |
+| `VERTEX_PENDING_TTL_MINUTES` | `30` |
 
 ## Límites conocidos
 
@@ -121,6 +161,8 @@ PowerShell **como administrador**. Para forzar el modo seguro siempre:
 - **El ledger detecta cambios, no los impide.** Quien tenga a la vez el `.duckdb` y la clave
   puede reescribir la cadena entera; por eso existe `/ledger/anchor`, para guardar el último
   hash fuera de la máquina.
+- **Una pendiente que caduca no se ejecuta nunca.** Si nadie decide a tiempo, queda `EXPIRED`
+  y hay que volver a lanzar la alerta.
 - La bóveda de la v1.0 (`vertex_nemesis_vault.duckdb`) no se migra: queda intacta como
   histórico y la v1.1 empieza una cadena nueva.
 
@@ -130,5 +172,5 @@ PowerShell **como administrador**. Para forzar el modo seguro siempre:
 .\Invoke-VertexRelease.ps1
 ```
 
-Genera `releases\Vertex-Nemesis-SOAR_v1.1.0_<fecha>.zip` y su `.sha256`. Nunca empaqueta
-`venv`, `libro`, bóvedas ni claves.
+Genera `releases\Vertex-Nemesis-SOAR_v1.2.0_<fecha>.zip` y su `.sha256`. Nunca empaqueta
+`venv`, `libro`, bóvedas, claves, tokens ni `__pycache__`.

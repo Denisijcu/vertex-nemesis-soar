@@ -1,26 +1,29 @@
-"""Vertex Nemesis SOAR v1.1 — gateway de contención con grounding verificado.
+"""Vertex Nemesis SOAR v1.2 — gateway de contención con grounding verificado
+y aprobación humana para las alertas AMARILLO.
 
 Flujo de cada alerta:
   1. El modelo (LM Studio) propone una herramienta o se abstiene.
   2. Si el modelo dice ABSTENTION, se respeta SIEMPRE, traiga lo que traiga.
   3. La herramienta tiene que estar en la lista blanca del servidor.
   4. El código verifica que los argumentos salgan del [CONTEXTO] (grounding).
-  5. defense_ops aplica la red de seguridad (IPs protegidas, expiración).
-  6. Todo, incluidos los fallos, queda en el ledger encadenado.
+  5. Si la acción apunta a una IP protegida, se rechaza ahí mismo.
+  6. Severidad: ROJO se ejecuta, AMARILLO queda pendiente del operador, VERDE no toca nada.
+  7. defense_ops aplica la red de seguridad (expiración, solo reglas VTX_).
+  8. Todo, incluidos los fallos y las decisiones humanas, queda en el ledger encadenado.
 """
 import json
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
 
-from core import defense_ops, vault
+from core import approvals, defense_ops, vault
 from core.config import FORCE_DRY_RUN, LM_STUDIO_URL, VERTEX_MODEL
 from core.grounding import verify_tool_call
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 client = OpenAI(base_url=LM_STUDIO_URL, api_key="not-needed")
 
@@ -43,13 +46,25 @@ class TelemetryAlert(BaseModel):
     question: str
     schema_def: str | None = None  # si no viene, el servidor pone su propio esquema
     dry_run: bool = True           # por defecto NO toca el firewall
+    severity: str = "AMARILLO"     # ROJO | AMARILLO | VERDE; por defecto pide aprobación
+
+
+class Decision(BaseModel):
+    note: str = ""
+
+
+def _require_operator(token: str | None) -> None:
+    if not approvals.token_ok(token):
+        raise HTTPException(status_code=403, detail="falta o es incorrecto X-Operator-Token")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     vault.init_vault()
+    approvals.load_operator_token()
     defense_ops.protected_ips(refresh=True)
     defense_ops.expire_blocks()
+    approvals.expire_pending()
     yield
 
 
@@ -154,7 +169,11 @@ def parse_decision(parsed: dict) -> dict:
 
 @app.post("/api/v1/analyze-and-contain")
 def analyze_and_contain(alert: TelemetryAlert):
+    severity = approvals.normalize_severity(alert.severity)
+    if not severity:
+        raise HTTPException(status_code=422, detail="severity debe ser ROJO, AMARILLO o VERDE")
     defense_ops.expire_blocks()
+    approvals.expire_pending()
     dry_run = alert.dry_run or FORCE_DRY_RUN
     user_payload = (
         f"[CONTEXTO] {alert.context}\n"
@@ -186,21 +205,42 @@ def analyze_and_contain(alert: TelemetryAlert):
             status = "REJECTED_UNGROUNDED"
             execution = {"result": "REJECTED_UNGROUNDED", "detail": grounding["reason"]}
         else:
-            execution = defense_ops.execute_mcp_action(d["tool"], d["args"], dry_run=dry_run)
-            status = ("REJECTED_PROTECTED_IP" if execution["result"] == "REJECTED_PROTECTED_IP"
-                      else "VERIFIED_OK")
+            protected = None
+            if d["tool"] == "block_firewall_ip":
+                protected = defense_ops.protection_reason(str(d["args"].get("ip_address", "")).strip())
+            decision = approvals.gate(d["tool"], severity)
+            if protected:
+                status = "REJECTED_PROTECTED_IP"
+                execution = {"result": "REJECTED_PROTECTED_IP",
+                             "ip": d["args"].get("ip_address"), "detail": protected}
+            elif decision == "BLOCK_LOW_SEVERITY":
+                status = "REJECTED_LOW_SEVERITY"
+                execution = {"result": "REJECTED_LOW_SEVERITY",
+                             "detail": f"una alerta {severity} no autoriza {d['tool']}"}
+            elif decision == "PENDING":
+                status = "PENDING_APPROVAL"
+                execution = approvals.create_pending(severity, d["tool"], d["args"], alert.context,
+                                                     grounding["evidence"], dry_run)
+            else:
+                execution = defense_ops.execute_mcp_action(d["tool"], d["args"], dry_run=dry_run)
+                status = ("REJECTED_PROTECTED_IP" if execution["result"] == "REJECTED_PROTECTED_IP"
+                          else "VERIFIED_OK")
 
     evidence = (grounding or {}).get("evidence") or d["evidence"] or ""
     receipt = vault.log_forensic_event(
         domain=d["domain"], status=status, tool=d["tool"] or "NONE", args=d["args"],
         evidence=evidence, exec_result={"execution": execution, "dry_run": dry_run,
-                                        "model": model_id, "grounding": grounding},
+                                        "severity": severity, "model": model_id,
+                                        "grounding": grounding},
     )
     if execution.get("result") == "NETSH_RULE_APPLIED":
         vault.link_block_event(execution["rule_name"], receipt["event_id"])
+    if status == "PENDING_APPROVAL":
+        vault.link_pending_request(execution["action_id"], receipt["event_id"])
 
     return {
         "status": status,
+        "severity": severity,
         "forensic_receipt": receipt,
         "model_decision": parsed,
         "grounding": grounding,
@@ -231,12 +271,40 @@ def get_blocks(all: bool = False):
 
 
 @app.delete("/api/v1/blocks/{rule_name}")
-def human_unblock(rule_name: str, dry_run: bool = False):
-    """Desbloqueo manual. El modelo no tiene esta herramienta a propósito."""
+def human_unblock(rule_name: str, dry_run: bool = False,
+                  x_operator_token: str | None = Header(default=None)):
+    """Desbloqueo manual del operador. El modelo no tiene esta herramienta a propósito."""
+    _require_operator(x_operator_token)
     result = defense_ops.unblock_rule(rule_name, dry_run=dry_run)
     receipt = vault.log_forensic_event("CYBER_MCP", "HUMAN_UNBLOCK", "unblock_firewall_ip",
                                        {"rule_name": rule_name}, "Acción manual del operador", result)
     return {"soar_execution": result, "forensic_receipt": receipt}
+
+
+@app.get("/api/v1/pending")
+def get_pending(all: bool = False):
+    approvals.expire_pending()
+    return {"pending": vault.list_pending(only_open=not all)}
+
+
+def _decide(action_id: str, approve: bool, decision: Decision | None, token: str | None):
+    _require_operator(token)
+    code, body = approvals.decide(action_id, approve, (decision.note if decision else ""))
+    if code != 200:
+        raise HTTPException(status_code=code, detail=body)
+    return body
+
+
+@app.post("/api/v1/pending/{action_id}/approve")
+def approve_pending(action_id: str, decision: Decision | None = Body(default=None),
+                    x_operator_token: str | None = Header(default=None)):
+    return _decide(action_id, True, decision, x_operator_token)
+
+
+@app.post("/api/v1/pending/{action_id}/reject")
+def reject_pending(action_id: str, decision: Decision | None = Body(default=None),
+                   x_operator_token: str | None = Header(default=None)):
+    return _decide(action_id, False, decision, x_operator_token)
 
 
 @app.post("/api/v1/blocks/expire")
@@ -247,5 +315,8 @@ def run_expiry():
 @app.get("/api/v1/health")
 def health():
     return {"version": VERSION, "force_dry_run": FORCE_DRY_RUN,
+            "pending_open": len(vault.list_pending(only_open=True)),
+            "severity_rules": {"ROJO": "ejecuta", "AMARILLO": "pide aprobación",
+                               "VERDE": "no toca el firewall"},
             "protected_ips": defense_ops.protected_ips(),
             "model_tools": list(defense_ops.MODEL_TOOLS)}

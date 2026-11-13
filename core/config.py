@@ -29,6 +29,13 @@ EXTRA_PROTECTED_IPS = [
     ip.strip() for ip in os.getenv("VERTEX_PROTECTED_IPS", "").split(",") if ip.strip()
 ]
 
+# Aprobación humana (fase 2.1)
+# Token del operador: sin él no se aprueba ni se rechaza nada. Vive fuera del proyecto.
+OPERATOR_TOKEN_PATH = Path(os.getenv("VERTEX_OPERATOR_TOKEN_FILE",
+                                     Path.home() / ".vertex" / "soar_operator.token"))
+# Minutos que una acción pendiente espera decisión antes de caducar sola.
+PENDING_TTL_MINUTES = int(os.getenv("VERTEX_PENDING_TTL_MINUTES", "30"))
+
 # Seguridad de ejecución: fuera de Windows nunca se ejecuta netsh de verdad.
 IS_WINDOWS = platform.system() == "Windows"
 FORCE_DRY_RUN = os.getenv("VERTEX_SOAR_DRY_RUN", "0") == "1" or not IS_WINDOWS

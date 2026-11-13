@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Version   = "1.1.0"
+$Version   = "1.2.0"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $ReleaseDir = Join-Path $PSScriptRoot "releases"
 $ZipName = "Vertex-Nemesis-SOAR_v${Version}_$Timestamp.zip"
@@ -11,12 +11,12 @@ if (!(Test-Path $ReleaseDir)) { New-Item -ItemType Directory -Path $ReleaseDir |
 # Se copia a una carpeta temporal, se limpia y se comprime desde ahí.
 $Stage = Join-Path $env:TEMP "vertex_soar_release_$Timestamp"
 New-Item -ItemType Directory -Path $Stage | Out-Null
-$FilesToPack = @("app.py", "client_test.py", "requirements.txt", "README.md", ".gitignore", "Invoke-VertexRelease.ps1", "core", "tests")
+$FilesToPack = @("app.py", "client_test.py", "requirements.txt", "README.md", ".gitignore", "Invoke-VertexRelease.ps1", "soar_operator.py", "core", "tests")
 foreach ($item in $FilesToPack) {
     Copy-Item -Path (Join-Path $PSScriptRoot $item) -Destination $Stage -Recurse
 }
 Get-ChildItem -Path $Stage -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
-Get-ChildItem -Path $Stage -Recurse -Include *.pyc, *.duckdb, *.key, .env | Remove-Item -Force
+Get-ChildItem -Path $Stage -Recurse -Include *.pyc, *.duckdb, *.key, *.token, .env | Remove-Item -Force
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $ZipPath -Force
 Remove-Item -Path $Stage -Recurse -Force
 

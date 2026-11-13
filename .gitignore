@@ -13,6 +13,7 @@ libro/
 *.duckdb
 *.duckdb.wal
 *.key
+*.token
 *.log
 forensic_reports/
 releases/
